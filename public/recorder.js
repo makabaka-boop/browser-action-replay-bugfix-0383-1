@@ -4,11 +4,15 @@
  * 每一步保存：
  *   pre  —— 执行前条件（完整状态摘要，含按本步修正过的字段/焦点/滚动值）
  *   post —— 执行后可观察状态摘要（settleMs 后采集，吸收异步回写）
+ * 摘要覆盖：焦点、标签页、弹窗开关与版本、字段值、文本节点、动态列表
+ * （如日志：条目数量 + 逐条内容）、滚动位置。
+ * 文本与列表条目入库前统一归一化：当前时间/日期/时间戳等非稳定内容
+ * 替换为占位符，不污染轨迹，也不会在回放时制造假分歧。
  * 密码字段在任何摘要/轨迹中都只出现 {type:'password', changed:boolean}。
  *
  * 回放：复位到初始状态 → 逐步核对 pre → 执行 → 等待与录制相同的沉淀时间 → 核对 post；
- *      元素缺失 / pre 不符 / post 不符，停在第一处，展示录制值与当前值，
- *      且不会继续执行后续步骤。
+ *      元素缺失 / pre 不符 / post 不符（含日志内容或条目数量变化），停在第一处，
+ *      展示录制值与当前值，且不会继续执行后续步骤。
  *
  * 会话令牌（session）：开始新录制或停止回放都会令令牌作废并递增，
  * 任何迟到的异步回调/界面更新都不可能再写进旧轨迹。 */
@@ -60,6 +64,23 @@
     return typeof v;
   }
 
+  /* 非稳定内容归一化：当前时间、日期、epoch 时间戳等“每次运行都不同”的内容，
+   * 在写入轨迹之前一律替换为占位符。日志条目里的当前时间因此既不会污染轨迹，
+   * 也不会在回放时制造假分歧；条目序号、文案等稳定部分原样保留，仍可比对。 */
+  function normalizeText(s) {
+    var out = String(s == null ? '' : s);
+    // ISO 类日期（可带时间）：2026-10-02 / 2026/10/2 / 2026-10-02T16:59:17.000Z
+    out = out.replace(/\d{4}[-/]\d{1,2}[-/]\d{1,2}([T ]\d{1,2}:\d{2}(:\d{2})?(\.\d{1,3})?\s*(Z|[+-]\d{2}:?\d{2})?)?/g, '[datetime]');
+    // 美式/点分日期：10/2/2026、02.10.2026
+    out = out.replace(/\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/g, '[date]');
+    out = out.replace(/\b\d{1,2}\.\d{1,2}\.\d{2,4}\b/g, '[date]');
+    // 时刻：16:59 / 16:59:17 / 4:59:17 PM / 下午4:59:17（含中文时段词与上下午标记）
+    out = out.replace(/(凌晨|早上|上午|中午|下午|傍晚|晚上)?\d{1,2}:\d{2}(:\d{2})?(\.\d{1,3})?(\s*[AaPp]\.?[Mm]\.?)?/g, '[time]');
+    // 纯数字时间戳（10 位及以上，如 epoch 秒/毫秒）
+    out = out.replace(/\d{10,}/g, '[timestamp]');
+    return out;
+  }
+
   function valueAtPath(obj, path) {
     if (!path || path === '$') return obj;
     var cur = obj;
@@ -83,8 +104,9 @@
     return String(el.value);
   }
 
-  /* 可观察状态摘要：焦点、标签页、弹窗、各字段值、文本节点、滚动位置。
-   * 只收集带稳定 ID 的元素；弹窗重建后节点是新的，但 ID 不变，摘要连续。 */
+  /* 可观察状态摘要：焦点、标签页、弹窗、各字段值、文本节点、动态列表、滚动位置。
+   * 只收集带稳定 ID 的元素；弹窗重建后节点是新的，但 ID 不变，摘要连续。
+   * 文本与列表条目入库前经过 normalizeText 归一化（当前时间等非稳定内容 → 占位符）。 */
   function buildSnapshot(win, root) {
     var doc = win.document;
     var snap = {
@@ -93,6 +115,7 @@
       modal: { open: false, version: 0 },
       values: {},
       text: {},
+      lists: {},
       scroll: { window: 0, byId: {} }
     };
 
@@ -115,7 +138,18 @@
     });
 
     Array.prototype.forEach.call(root.querySelectorAll('[data-snapshot-text]'), function (el) {
-      if (el.id) snap.text[el.id] = el.textContent;
+      if (el.id) snap.text[el.id] = normalizeText(el.textContent);
+    });
+
+    // 动态列表（如日志）：条目数量与逐条内容都进入摘要 —— 内容/条数变化即分歧。
+    // 条目文本同样先归一化，当前时间等非稳定内容不会写进轨迹。
+    Array.prototype.forEach.call(root.querySelectorAll('[data-snapshot-list]'), function (el) {
+      if (!el.id) return;
+      var items = [];
+      Array.prototype.forEach.call(el.children, function (item) {
+        items.push(normalizeText(item.textContent));
+      });
+      snap.lists[el.id] = { count: items.length, items: items };
     });
 
     snap.scroll.window = Math.round(win.scrollY || doc.documentElement.scrollTop || 0);
@@ -834,11 +868,11 @@
       var h = this.halt;
       html += '<div class="wt-rec-halt"><h4>⛔ 停在第一处分歧</h4>';
       var where = h.stepIndex == null ? '初始状态' : ('第 ' + (h.stepIndex + 1) + ' 步' +
-        (h.type && TYPE_LABELS[h.type] ? '（' + TYPE_LABELS[h.type] + ' ' + h.target + '）' : ''));
+        (h.type && TYPE_LABELS[h.type] ? '（' + TYPE_LABELS[h.type] + ' ' + esc(h.target) + '）' : ''));
       html += '<div>位置：' + where + '</div>';
-      html += '<div>原因：' + (PHASE_LABELS[h.phase] || h.phase) + '</div>';
+      html += '<div>原因：' + (PHASE_LABELS[h.phase] || esc(h.phase)) + '</div>';
       if (h.diff) {
-        html += '<div>分歧字段：<span class="k">' + h.diff.path + '</span></div>';
+        html += '<div>分歧字段：<span class="k">' + esc(h.diff.path) + '</span></div>';
         html += '<div class="wt-rec-kv"><span class="k">录制值</span>: ' + fmt(h.diff.recorded) + '</div>';
         html += '<div class="wt-rec-kv"><span class="k">当前值</span>: ' + fmt(h.diff.current) + '</div>';
       }
@@ -847,11 +881,18 @@
     body.innerHTML = html;
   };
 
+  /* 分歧值/路径可能包含页面文本（日志条目、用户输入），渲染前必须转义，
+   * 否则报告内容会被浏览器当成标签吞掉 —— 分歧报告本身不能失真。 */
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
   function fmt(v) {
     if (v === null) return '<span style="color:#fca5a5">（缺失）</span>';
     if (v === undefined) return 'undefined';
-    if (typeof v === 'string') return JSON.stringify(v);
-    return JSON.stringify(v);
+    return esc(JSON.stringify(v));
   }
 
   // ------------------------------------------------ 挂载
@@ -879,6 +920,7 @@
       Recorder: Recorder,
       buildSnapshot: buildSnapshot,
       firstDiff: firstDiff,
+      normalizeText: normalizeText,
       valueAtPath: valueAtPath
     };
   }
