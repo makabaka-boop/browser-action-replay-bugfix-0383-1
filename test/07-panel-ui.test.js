@@ -4,6 +4,15 @@ const test = require('node:test');
 const assert = require('node:assert');
 const { bootPage, sleep, click } = require('./helpers');
 
+/* 轮询直到条件成立（避免用固定 sleep 等待异步回放落定）。 */
+async function waitUntil(cond, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error('waitUntil 超时');
+    await sleep(2);
+  }
+}
+
 /* 面板集成：通过真实面板按钮开始/停止/回放；分歧时面板展示停点、录制值与当前值。 */
 test('录制器面板：开始/停止/回放，分歧时渲染停点与对照值', async () => {
   const { window, recorder, dom } = await bootPage();
@@ -24,9 +33,10 @@ test('录制器面板：开始/停止/回放，分歧时渲染停点与对照值
   track.steps[tick()].post.modal.open = false;
   function tick() { return track.steps.findIndex(s => s.target === 'wt-open-modal-btn'); }
 
-  // 面板回放
+  // 面板回放：点击真实面板按钮启动，轮询等待回放真正落定
+  //（回放包含 60ms 沉淀窗口，固定 sleep 在高负载并行测试下会抢跑）。
   doc.getElementById('wt-rec-replay').click();
-  await sleep(120);
+  await waitUntil(() => recorder.mode === 'idle' && !!recorder.halt);
 
   const haltBox = doc.querySelector('.wt-rec-halt');
   assert.ok(haltBox, '面板必须渲染停驻框');

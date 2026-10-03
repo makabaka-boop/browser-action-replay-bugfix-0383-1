@@ -70,7 +70,9 @@
   <section id="wt-panel-activity" class="wt-panel wt-hidden" role="tabpanel">
     <button type="button" id="wt-add-log-btn" class="wt-btn">追加一条日志</button>
     <div id="wt-log-scroll" class="wt-scroll-area" data-snapshot-scroll>
-      <ul id="wt-log-list"></ul>
+      <!-- 动态条目列表：按条目顺序采集（条目数量/文本变化都会成为可观察分歧）；
+           条目中的当前时间等非稳定文本由录制器归一化，不制造伪分歧 -->
+      <ul id="wt-log-list" data-snapshot-list></ul>
     </div>
   </section>
 

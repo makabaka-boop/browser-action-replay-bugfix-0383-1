@@ -60,6 +60,23 @@
     return typeof v;
   }
 
+  /* 非稳定文本归一化：把每次录制/回放都会变化的当前时间替换为固定占位符。
+   * 日志里的“手动追加 @ 14:03:07”这类时间戳不得制造伪分歧；
+   * 但条目序号、业务文字保持原样，真实的内容差异仍能被发现。
+   * 顺序敏感：先吃掉完整日期时间（ISO），再退化为纯日期 / 纯钟点。 */
+  var VOLATILE_PATTERNS = [
+    [/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?/g, '<时间>'],
+    [/\d{4}[/-]\d{1,2}[/-]\d{1,2}/g, '<日期>'],
+    [/\d{1,2}:\d{2}(?::\d{2})?(?:\s?[AP]\.?M\.?)?/gi, '<时间>']
+  ];
+  function normalizeText(str) {
+    var out = String(str);
+    for (var i = 0; i < VOLATILE_PATTERNS.length; i++) {
+      out = out.replace(VOLATILE_PATTERNS[i][0], VOLATILE_PATTERNS[i][1]);
+    }
+    return out;
+  }
+
   function valueAtPath(obj, path) {
     if (!path || path === '$') return obj;
     var cur = obj;
@@ -93,6 +110,7 @@
       modal: { open: false, version: 0 },
       values: {},
       text: {},
+      lists: {},
       scroll: { window: 0, byId: {} }
     };
 
@@ -115,7 +133,20 @@
     });
 
     Array.prototype.forEach.call(root.querySelectorAll('[data-snapshot-text]'), function (el) {
-      if (el.id) snap.text[el.id] = el.textContent;
+      // 非稳定文本（当前时间等）先归一化，避免回放时制造伪分歧
+      if (el.id) snap.text[el.id] = normalizeText(el.textContent);
+    });
+
+    // 动态条目列表（如“追加日志”）：按条目顺序采集文本数组。
+    // 条目新增/删除体现为数组长度差异，文本改动体现为下标处差异，
+    // firstDiff 会停在第一处不一致的条目。
+    Array.prototype.forEach.call(root.querySelectorAll('[data-snapshot-list]'), function (el) {
+      if (!el.id) return;
+      var entries = [];
+      Array.prototype.forEach.call(el.children, function (child) {
+        entries.push(normalizeText(child.textContent));
+      });
+      snap.lists[el.id] = entries;
     });
 
     snap.scroll.window = Math.round(win.scrollY || doc.documentElement.scrollTop || 0);
@@ -563,6 +594,7 @@
     } else if (this.mode === 'playing') {
       this.session++;                // 正在等待的回放循环会在下一 tick 退出
       this.mode = 'idle';
+      this._neutralizeAppTimers();   // 手动停止：迟到回写同样不得改动停止后的页面
     }
     this._renderPanel();
   };
@@ -598,6 +630,18 @@
 
   Recorder.prototype._alive = function (token) {
     return this.mode === 'playing' && token === this.playToken;
+  };
+
+  /* 停止/停住回放后，应用自身仍可能挂着延迟回写（示例页弹窗确认后的 30ms 定时器）。
+   * 轨迹在回放期间从不写入，因此这些迟到更新不可能污染轨迹；但它们可能改动页面、
+   * 干扰用户对照“录制值/当前值”。这里作废演练页登记的挂起定时器，冻结现场。
+   * （录制器自己的令牌机制已保证迟到回调不会进入回放循环或轨迹。） */
+  Recorder.prototype._neutralizeAppTimers = function () {
+    var app = this.win.WalkthroughApp;
+    if (app && Array.isArray(app.pendingAsync)) {
+      app.pendingAsync.forEach(clearTimeout);
+      app.pendingAsync = [];
+    }
   };
 
   Recorder.prototype._wait = function (ms, token) {
@@ -675,6 +719,7 @@
   Recorder.prototype._halt = function (i, phase, diff, track, token) {
     this.mode = 'idle';
     this.session++;                 // 后续动作不再发生，迟到回调全部作废
+    this._neutralizeAppTimers();    // 冻结现场：应用挂起的延迟回写不得改动停驻后的页面
     var step = i != null && i >= 0 ? track.steps[i] : null;
     this.halt = {
       stepIndex: i,
@@ -879,6 +924,7 @@
       Recorder: Recorder,
       buildSnapshot: buildSnapshot,
       firstDiff: firstDiff,
+      normalizeText: normalizeText,
       valueAtPath: valueAtPath
     };
   }
